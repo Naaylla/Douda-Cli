@@ -8,10 +8,12 @@ import sys
 from douda.game import play
 from douda.leaderboard import LeaderboardError, get_scores, submit_score
 
+DEFAULT_LEADERBOARD_URL = "https://douda-cli.onrender.com"
+
 
 def _leaderboard_url() -> str:
     return os.environ.get(
-        "DOUDA_LEADERBOARD_URL", "http://127.0.0.1:8765"
+        "DOUDA_LEADERBOARD_URL", DEFAULT_LEADERBOARD_URL
     ).rstrip("/")
 
 
