@@ -5,6 +5,7 @@ import json
 import urllib.error
 import urllib.request
 from typing import Any
+from urllib.parse import urlencode
 
 
 class LeaderboardError(Exception):
@@ -56,9 +57,15 @@ def submit_score(base_url: str, name: str, score: int) -> dict[str, Any]:
 
 
 def get_scores(
-    base_url: str, limit: int = 10, offset: int = 0
+    base_url: str,
+    limit: int = 10,
+    offset: int = 0,
+    player_name: str | None = None,
 ) -> dict[str, Any]:
-    """Fetch one page of leaderboard scores."""
+    """Fetch leaderboard scores and optionally a player's best rank."""
+    query = {"limit": limit, "offset": offset}
+    if player_name:
+        query["name"] = player_name
     return _request(
-        f"{base_url.rstrip('/')}/scores?limit={limit}&offset={offset}"
+        f"{base_url.rstrip('/')}/scores?{urlencode(query)}"
     )

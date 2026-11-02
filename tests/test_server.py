@@ -50,6 +50,26 @@ class LeaderboardServerTests(unittest.TestCase):
         self.assertEqual([entry["name"] for entry in result["scores"]], ["Sam", "Ada"])
         self.assertEqual([entry["rank"] for entry in result["scores"]], [2, 3])
 
+    def test_leaderboard_includes_top_three_and_personal_best_rank(self) -> None:
+        submit_score(self.url, "Ada", 10)
+        submit_score(self.url, "Lin", 100)
+        submit_score(self.url, "Sam", 80)
+        submit_score(self.url, "Jo", 50)
+        submit_score(self.url, "ada", 20)
+
+        result = get_scores(self.url, limit=3, player_name="Ada")
+
+        self.assertEqual([entry["name"] for entry in result["scores"]], ["Lin", "Sam", "Jo"])
+        self.assertEqual(
+            result["player"],
+            {"name": "ada", "score": 20, "rank": 4},
+        )
+
+    def test_personal_rank_is_null_when_player_has_no_scores(self) -> None:
+        result = get_scores(self.url, player_name="Unknown")
+
+        self.assertIsNone(result["player"])
+
     def test_invalid_scores_are_rejected(self) -> None:
         for score in (-1, True, 1.5, "12"):
             with self.subTest(score=score):
