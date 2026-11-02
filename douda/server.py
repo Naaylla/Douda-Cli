@@ -1,0 +1,213 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Iterator
+from urllib.parse import parse_qs, urlsplit
+
+
+def _connect(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db_path, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            score INTEGER NOT NULL CHECK (score >= 0),
+            created_at TEXT NOT NULL DEFAULT (
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            )
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS scores_order ON scores(score DESC, id ASC)"
+    )
+    return connection
+
+
+@contextmanager
+def _database(db_path: Path) -> Iterator[sqlite3.Connection]:
+    connection = _connect(db_path)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
+def create_server(
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    db_path: str | Path = "douda-leaderboard.sqlite3",
+) -> ThreadingHTTPServer:
+    """Create an HTTP server that stores scores in the supplied SQLite file."""
+    path = Path(db_path).expanduser().resolve()
+
+    class LeaderboardHandler(BaseHTTPRequestHandler):
+        def _send_json(self, status: int, payload: dict[str, object]) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            parsed = urlsplit(self.path)
+            if parsed.path == "/health":
+                self._send_json(200, {"status": "ok"})
+                return
+            if parsed.path != "/scores":
+                self._send_json(404, {"error": "Not found"})
+                return
+
+            query = parse_qs(parsed.query)
+            try:
+                limit = int(query.get("limit", ["10"])[0])
+                offset = int(query.get("offset", ["0"])[0])
+            except ValueError:
+                self._send_json(400, {"error": "limit and offset must be integers"})
+                return
+            if not 1 <= limit <= 100 or offset < 0:
+                self._send_json(
+                    400,
+                    {"error": "limit must be 1-100 and offset must be non-negative"},
+                )
+                return
+
+            with _database(path) as connection:
+                total = connection.execute(
+                    "SELECT COUNT(*) FROM scores"
+                ).fetchone()[0]
+                rows = connection.execute(
+                    """
+                    SELECT name, score, created_at
+                    FROM scores
+                    ORDER BY score DESC, id ASC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (limit, offset),
+                ).fetchall()
+            self._send_json(
+                200,
+                {
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "scores": [
+                        {
+                            "rank": offset + index + 1,
+                            "name": row["name"],
+                            "score": row["score"],
+                            "created_at": row["created_at"],
+                        }
+                        for index, row in enumerate(rows)
+                    ],
+                },
+            )
+
+        def do_POST(self) -> None:
+            if urlsplit(self.path).path != "/scores":
+                self._send_json(404, {"error": "Not found"})
+                return
+
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._send_json(400, {"error": "Invalid Content-Length"})
+                return
+            if not 0 < content_length <= 4096:
+                self._send_json(400, {"error": "Request body must be 1-4096 bytes"})
+                return
+
+            try:
+                payload = json.loads(self.rfile.read(content_length))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(400, {"error": "Request body must be valid JSON"})
+                return
+            if not isinstance(payload, dict):
+                self._send_json(400, {"error": "Request body must be a JSON object"})
+                return
+
+            name = payload.get("name")
+            score = payload.get("score")
+            if not isinstance(name, str):
+                self._send_json(400, {"error": "name must be a string"})
+                return
+            name = name.strip()
+            if (
+                not name
+                or len(name) > 24
+                or any(ord(character) < 32 or ord(character) == 127 for character in name)
+            ):
+                self._send_json(
+                    400,
+                    {"error": "name must be 1-24 characters without control characters"},
+                )
+                return
+            if (
+                isinstance(score, bool)
+                or not isinstance(score, int)
+                or not 0 <= score <= 2_147_483_647
+            ):
+                self._send_json(
+                    400,
+                    {"error": "score must be an integer between 0 and 2147483647"},
+                )
+                return
+
+            with _database(path) as connection:
+                cursor = connection.execute(
+                    "INSERT INTO scores (name, score) VALUES (?, ?)",
+                    (name, score),
+                )
+                score_id = cursor.lastrowid
+            self._send_json(201, {"id": score_id, "name": name, "score": score})
+
+        def log_message(self, format: str, *args: object) -> None:
+            print(f"{self.address_string()} - {format % args}")
+
+    return ThreadingHTTPServer((host, port), LeaderboardHandler)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the Douda leaderboard server.")
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("DOUDA_SERVER_HOST", "127.0.0.1"),
+        help="interface to bind (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("DOUDA_SERVER_PORT", "8765")),
+        help="port to listen on (default: 8765)",
+    )
+    parser.add_argument(
+        "--db",
+        default=os.environ.get("DOUDA_DB_PATH", "douda-leaderboard.sqlite3"),
+        help="SQLite database path",
+    )
+    args = parser.parse_args()
+
+    server = create_server(args.host, args.port, args.db)
+    print(f"Douda leaderboard listening on http://{args.host}:{args.port}")
+    print(f"Scores are stored in {Path(args.db).expanduser().resolve()}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping Douda leaderboard.")
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
