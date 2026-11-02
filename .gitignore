@@ -5,3 +5,7 @@ __pycache__/
 .venv/
 build/
 dist/
+.neon
+node_modules/
+.env.local
+.env.local.before-neon-setup

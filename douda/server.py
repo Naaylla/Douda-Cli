@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Iterator
 from urllib.parse import parse_qs, urlsplit
 
+from psycopg_pool import ConnectionPool
+from dotenv import load_dotenv
+
 
 def _connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -33,6 +36,113 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return connection
 
 
+class LeaderboardStore:
+    def __init__(self, db_path: Path, database_url: str | None) -> None:
+        self._db_path = db_path
+        self._pool = (
+            ConnectionPool(conninfo=database_url, min_size=1, max_size=10)
+            if database_url
+            else None
+        )
+        self.initialize()
+
+    def initialize(self) -> None:
+        if self._pool is None:
+            with _database(self._db_path):
+                pass
+            return
+
+        with self._pool.connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS douda_scores (
+                    id BIGSERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    score INTEGER NOT NULL CHECK (score >= 0),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS douda_scores_order
+                ON douda_scores(score DESC, id ASC)
+                """
+            )
+
+    def page(self, limit: int, offset: int) -> tuple[int, list[dict[str, object]]]:
+        if self._pool is None:
+            with _database(self._db_path) as connection:
+                total = connection.execute(
+                    "SELECT COUNT(*) FROM scores"
+                ).fetchone()[0]
+                rows = connection.execute(
+                    """
+                    SELECT name, score, created_at
+                    FROM scores
+                    ORDER BY score DESC, id ASC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (limit, offset),
+                ).fetchall()
+            return total, [
+                {
+                    "rank": offset + index + 1,
+                    "name": row["name"],
+                    "score": row["score"],
+                    "created_at": row["created_at"],
+                }
+                for index, row in enumerate(rows)
+            ]
+
+        with self._pool.connection() as connection:
+            total = connection.execute(
+                "SELECT COUNT(*) FROM douda_scores"
+            ).fetchone()[0]
+            rows = connection.execute(
+                """
+                SELECT name, score, created_at
+                FROM douda_scores
+                ORDER BY score DESC, id ASC
+                LIMIT %s OFFSET %s
+                """,
+                (limit, offset),
+            ).fetchall()
+        return total, [
+            {
+                "rank": offset + index + 1,
+                "name": row[0],
+                "score": row[1],
+                "created_at": row[2].isoformat(),
+            }
+            for index, row in enumerate(rows)
+        ]
+
+    def insert(self, name: str, score: int) -> int:
+        if self._pool is None:
+            with _database(self._db_path) as connection:
+                cursor = connection.execute(
+                    "INSERT INTO scores (name, score) VALUES (?, ?)",
+                    (name, score),
+                )
+                return int(cursor.lastrowid)
+
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """
+                INSERT INTO douda_scores (name, score)
+                VALUES (%s, %s)
+                RETURNING id
+                """,
+                (name, score),
+            ).fetchone()
+        return int(row[0])
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.close()
+
+
 @contextmanager
 def _database(db_path: Path) -> Iterator[sqlite3.Connection]:
     connection = _connect(db_path)
@@ -47,9 +157,11 @@ def create_server(
     host: str = "127.0.0.1",
     port: int = 8765,
     db_path: str | Path = "douda-leaderboard.sqlite3",
+    database_url: str | None = None,
 ) -> ThreadingHTTPServer:
-    """Create an HTTP server that stores scores in the supplied SQLite file."""
+    """Create an HTTP server backed by Postgres or a local SQLite file."""
     path = Path(db_path).expanduser().resolve()
+    store = LeaderboardStore(path, database_url or os.environ.get("DATABASE_URL"))
 
     class LeaderboardHandler(BaseHTTPRequestHandler):
         def _send_json(self, status: int, payload: dict[str, object]) -> None:
@@ -83,34 +195,14 @@ def create_server(
                 )
                 return
 
-            with _database(path) as connection:
-                total = connection.execute(
-                    "SELECT COUNT(*) FROM scores"
-                ).fetchone()[0]
-                rows = connection.execute(
-                    """
-                    SELECT name, score, created_at
-                    FROM scores
-                    ORDER BY score DESC, id ASC
-                    LIMIT ? OFFSET ?
-                    """,
-                    (limit, offset),
-                ).fetchall()
+            total, scores = store.page(limit, offset)
             self._send_json(
                 200,
                 {
                     "total": total,
                     "limit": limit,
                     "offset": offset,
-                    "scores": [
-                        {
-                            "rank": offset + index + 1,
-                            "name": row["name"],
-                            "score": row["score"],
-                            "created_at": row["created_at"],
-                        }
-                        for index, row in enumerate(rows)
-                    ],
+                    "scores": scores,
                 },
             )
 
@@ -164,21 +256,23 @@ def create_server(
                 )
                 return
 
-            with _database(path) as connection:
-                cursor = connection.execute(
-                    "INSERT INTO scores (name, score) VALUES (?, ?)",
-                    (name, score),
-                )
-                score_id = cursor.lastrowid
+            score_id = store.insert(name, score)
             self._send_json(201, {"id": score_id, "name": name, "score": score})
 
         def log_message(self, format: str, *args: object) -> None:
             print(f"{self.address_string()} - {format % args}")
 
-    return ThreadingHTTPServer((host, port), LeaderboardHandler)
+    class LeaderboardHTTPServer(ThreadingHTTPServer):
+        def server_close(self) -> None:
+            super().server_close()
+            store.close()
+
+    return LeaderboardHTTPServer((host, port), LeaderboardHandler)
 
 
 def main() -> None:
+    load_dotenv(".env.local")
+    load_dotenv(".env")
     parser = argparse.ArgumentParser(description="Run the Douda leaderboard server.")
     parser.add_argument(
         "--host",
