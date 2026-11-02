@@ -100,7 +100,13 @@ def _board_size(columns: int | None = None, lines: int | None = None) -> tuple[i
         columns = terminal.columns if columns is None else columns
         lines = terminal.lines if lines is None else lines
 
-    return min(WIDTH, max(3, columns - 2)), min(HEIGHT, max(1, lines - 3))
+    available_height = max(1, lines - 15)
+    return min(WIDTH, max(3, columns - 2)), min(HEIGHT, available_height)
+
+
+def _movement_delay(score: int, direction: tuple[int, int]) -> float:
+    delay = max(0.055, 0.13 - score * 0.0007)
+    return delay * 1.5 if direction[1] else delay
 
 
 def _render(
@@ -111,28 +117,128 @@ def _render(
     width: int,
     height: int,
     columns: int,
+    top_scores: list[dict[str, object]] | None = None,
+    top_padding: int = 0,
+    color: bool = False,
+    player_position: dict[str, object] | None = None,
 ) -> str:
+    def paint(text: str, code: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if color else text
+
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        "■".encode(encoding)
+        snake_glyph = "■"
+    except UnicodeEncodeError:
+        snake_glyph = "#"
+    try:
+        "◆".encode(encoding)
+        food_glyph = "◆"
+    except UnicodeEncodeError:
+        food_glyph = "*"
+
+    title_letters = {
+        "D": (".__. ", "|   \\", "|   |", "|   /", "|___/"),
+        "O": (".---.", "|   |", "|   |", "|   |", "'---'"),
+        "U": ("|   |", "|   |", "|   |", "\\   /", "'---'"),
+        "A": (".---.", "|   |", "|---|", "|   |", "|   |"),
+    }
+    title = [
+        "  ".join(title_letters[letter][row] for letter in "DOUDA")
+        for row in range(5)
+    ]
+    if columns < len(title[0]):
+        title = ["DOUDA"]
+    title_width = max(map(len, title))
+    header = [
+        paint(line.ljust(title_width).center(columns), "1;36")
+        for line in title
+    ]
+    header.append(paint("by Naaylla".center(columns), "2;37"))
+
     body = set(snake[1:])
     head = snake[0]
     border = "+" + "-" * width + "+"
-    lines = [border]
+    board_lines = [paint(border, "36")]
     for y in range(height):
         row = []
         for x in range(width):
             point = (x, y)
             if point == head:
-                row.append("■")
+                row.append(paint(snake_glyph, "1;32"))
             elif point in body:
-                row.append("■")
+                row.append(paint(snake_glyph, "32"))
             elif point == food:
-                row.append("◆")
+                row.append(paint(food_glyph, "1;33"))
             else:
                 row.append(" ")
-        lines.append("|" + "".join(row) + "|")
-    lines.append(border)
-    status = f"{name[:8]} Score:{score} WASD/Q"
-    lines.append(status[:columns])
-    return "\n".join(lines)
+        board_lines.append("|" + "".join(row) + "|")
+    board_lines.append(paint(border, "36"))
+    score_text = f" SCORE  {score:04d} " if width >= 11 else str(score)
+    score_line = "|" + score_text.center(width) + "|"
+    board_lines.extend(
+        [
+            paint(border, "36"),
+            paint(score_line, "1;33"),
+            paint(border, "36"),
+            paint(
+                " WASD / ARROWS MOVE  Q QUIT "[: width + 2].center(width + 2),
+                "2;37",
+            ),
+        ]
+    )
+
+    panel_width = 28
+    panel_lines = [
+        paint("+" + "-" * (panel_width - 2) + "+", "36"),
+        paint("|" + "  LEADERBOARD".center(panel_width - 2) + "|", "1;36"),
+        paint("+" + "-" * (panel_width - 2) + "+", "36"),
+    ]
+    try:
+        "♛".encode(encoding)
+        crown = "♛"
+    except UnicodeEncodeError:
+        crown = "*"
+    crown_colors = ("33", "37", "31")
+    if top_scores:
+        for rank, entry in enumerate(top_scores[:3], start=1):
+            player_name = str(entry.get("name", "Player"))[:12]
+            player_score = str(entry.get("score", 0))[-6:]
+            row = f"| {crown}{rank} {player_name:<11} {player_score:>6} |"
+            panel_lines.append(paint(row, crown_colors[rank - 1]))
+    else:
+        panel_lines.append("|  No scores yet            |")
+        panel_lines.append("|  Be the first!            |")
+    panel_lines.append(paint("+" + "-" * (panel_width - 2) + "+", "36"))
+    if player_position and player_position.get("rank", 0) > 3:
+        position = f"YOU ARE #{player_position['rank']} · {player_position['score']} pts"
+        panel_lines.append(
+            paint(
+                "|" + f" {position[:panel_width - 4]}".ljust(panel_width - 2) + "|",
+                "1;32",
+            )
+        )
+        panel_lines.append(paint("+" + "-" * (panel_width - 2) + "+", "36"))
+
+    show_panel = columns >= width + 2 + 4 + panel_width
+    if show_panel:
+        content_width = width + 2 + 4 + panel_width
+        left_padding = max(0, (columns - content_width) // 2)
+        content_lines = []
+        for index in range(max(len(board_lines), len(panel_lines))):
+            board_line = board_lines[index] if index < len(board_lines) else ""
+            panel_line = panel_lines[index] if index < len(panel_lines) else ""
+            content_lines.append(
+                " " * left_padding
+                + board_line.ljust(width + 2)
+                + " " * 4
+                + panel_line
+            )
+    else:
+        left_padding = max(0, (columns - (width + 2)) // 2)
+        content_lines = [" " * left_padding + line for line in board_lines]
+
+    return "\n" * top_padding + "\n".join(header + [""] + content_lines)
 
 
 def _draw(
@@ -143,18 +249,41 @@ def _draw(
     width: int,
     height: int,
     columns: int,
+    top_scores: list[dict[str, object]] | None,
+    top_padding: int,
+    color: bool,
+    player_position: dict[str, object] | None,
 ) -> None:
     print(
-        "\033[2J\033[H" + _render(snake, food, score, name, width, height, columns),
+        "\033[H\033[J"
+        + _render(
+            snake,
+            food,
+            score,
+            name,
+            width,
+            height,
+            columns,
+            top_scores,
+            top_padding,
+            color,
+            player_position,
+        ),
         end="",
     )
     sys.stdout.flush()
 
 
-def play(name: str) -> tuple[int, bool]:
+def play(
+    name: str,
+    top_scores: list[dict[str, object]] | None = None,
+    player_position: dict[str, object] | None = None,
+) -> tuple[int, bool]:
     """Play one game; return (score, whether the run ended by winning/dying)."""
     columns, terminal_lines = shutil.get_terminal_size(fallback=(80, 24))
     width, height = _board_size(columns, terminal_lines)
+    top_padding = min(2, max(0, terminal_lines - height - 5))
+    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
     snake_length = min(3, width - 1)
     start_x = min(width // 2, width - 2)
     snake = [(start_x - index, height // 2) for index in range(snake_length)]
@@ -167,7 +296,19 @@ def play(name: str) -> tuple[int, bool]:
     try:
         with Keyboard() as keyboard:
             while True:
-                _draw(snake, food, score, name, width, height, columns)
+                _draw(
+                    snake,
+                    food,
+                    score,
+                    name,
+                    width,
+                    height,
+                    columns,
+                    top_scores,
+                    top_padding,
+                    color,
+                    player_position,
+                )
                 key = keyboard.read()
                 if key == "q":
                     break
@@ -197,8 +338,20 @@ def play(name: str) -> tuple[int, bool]:
                 else:
                     snake.pop()
 
-                time.sleep(max(0.055, 0.13 - score * 0.0007))
+                time.sleep(_movement_delay(score, direction))
     finally:
         print("\033[?25h")
 
     return score, ended
+
+
+def wait_for_replay() -> bool:
+    print("Do you want to replay? Press R to replay or Q to quit.")
+    with Keyboard() as keyboard:
+        while True:
+            key = keyboard.read()
+            if key == "r":
+                return True
+            if key == "q":
+                return False
+            time.sleep(0.05)

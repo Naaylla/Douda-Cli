@@ -70,7 +70,9 @@ class LeaderboardStore:
                 """
             )
 
-    def page(self, limit: int, offset: int) -> tuple[int, list[dict[str, object]]]:
+    def page(
+        self, limit: int, offset: int, player_name: str | None = None
+    ) -> tuple[int, list[dict[str, object]], dict[str, object] | None]:
         if self._pool is None:
             with _database(self._db_path) as connection:
                 total = connection.execute(
@@ -85,6 +87,22 @@ class LeaderboardStore:
                     """,
                     (limit, offset),
                 ).fetchall()
+                player_row = None
+                if player_name:
+                    player_row = connection.execute(
+                        """
+                        SELECT name, score, rank
+                        FROM (
+                            SELECT id, name, score,
+                                ROW_NUMBER() OVER (ORDER BY score DESC, id ASC) AS rank
+                            FROM scores
+                        ) ranked
+                        WHERE lower(name) = lower(?)
+                        ORDER BY score DESC, id ASC
+                        LIMIT 1
+                        """,
+                        (player_name,),
+                    ).fetchone()
             return total, [
                 {
                     "rank": offset + index + 1,
@@ -93,7 +111,15 @@ class LeaderboardStore:
                     "created_at": row["created_at"],
                 }
                 for index, row in enumerate(rows)
-            ]
+            ], (
+                {
+                    "name": player_row["name"],
+                    "score": player_row["score"],
+                    "rank": player_row["rank"],
+                }
+                if player_row
+                else None
+            )
 
         with self._pool.connection() as connection:
             total = connection.execute(
@@ -108,15 +134,43 @@ class LeaderboardStore:
                 """,
                 (limit, offset),
             ).fetchall()
-        return total, [
-            {
-                "rank": offset + index + 1,
-                "name": row[0],
-                "score": row[1],
-                "created_at": row[2].isoformat(),
-            }
-            for index, row in enumerate(rows)
-        ]
+            player_row = None
+            if player_name:
+                player_row = connection.execute(
+                    """
+                    SELECT name, score, rank
+                    FROM (
+                        SELECT id, name, score,
+                            ROW_NUMBER() OVER (ORDER BY score DESC, id ASC) AS rank
+                        FROM douda_scores
+                    ) ranked
+                    WHERE lower(name) = lower(%s)
+                    ORDER BY score DESC, id ASC
+                    LIMIT 1
+                    """,
+                    (player_name,),
+                ).fetchone()
+        return (
+            total,
+            [
+                {
+                    "rank": offset + index + 1,
+                    "name": row[0],
+                    "score": row[1],
+                    "created_at": row[2].isoformat(),
+                }
+                for index, row in enumerate(rows)
+            ],
+            (
+                {
+                    "name": player_row[0],
+                    "score": player_row[1],
+                    "rank": player_row[2],
+                }
+                if player_row
+                else None
+            ),
+        )
 
     def insert(self, name: str, score: int) -> int:
         if self._pool is None:
@@ -195,7 +249,24 @@ def create_server(
                 )
                 return
 
-            total, scores = store.page(limit, offset)
+            player_name = query.get("name", [None])[0]
+            if player_name is not None:
+                player_name = player_name.strip()
+                if (
+                    not player_name
+                    or len(player_name) > 24
+                    or any(
+                        ord(character) < 32 or ord(character) == 127
+                        for character in player_name
+                    )
+                ):
+                    self._send_json(
+                        400,
+                        {"error": "name must be 1-24 characters without control characters"},
+                    )
+                    return
+
+            total, scores, player = store.page(limit, offset, player_name)
             self._send_json(
                 200,
                 {
@@ -203,6 +274,7 @@ def create_server(
                     "limit": limit,
                     "offset": offset,
                     "scores": scores,
+                    "player": player,
                 },
             )
 
