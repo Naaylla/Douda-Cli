@@ -3,9 +3,9 @@ from __future__ import annotations
 import os
 import random
 import select
+import shutil
 import sys
 import time
-from typing import Iterator
 
 WIDTH = 30
 HEIGHT = 14
@@ -81,15 +81,58 @@ class Keyboard:
         return sequence
 
 
-def _place_food(snake: list[tuple[int, int]]) -> tuple[int, int] | None:
+def _place_food_on_board(
+    snake: list[tuple[int, int]], width: int, height: int
+) -> tuple[int, int] | None:
     occupied = set(snake)
     available = [
         (x, y)
-        for y in range(HEIGHT)
-        for x in range(WIDTH)
+        for y in range(height)
+        for x in range(width)
         if (x, y) not in occupied
     ]
     return random.choice(available) if available else None
+
+
+def _board_size(columns: int | None = None, lines: int | None = None) -> tuple[int, int]:
+    if columns is None or lines is None:
+        terminal = shutil.get_terminal_size(fallback=(80, 24))
+        columns = terminal.columns if columns is None else columns
+        lines = terminal.lines if lines is None else lines
+
+    return min(WIDTH, max(3, columns - 2)), min(HEIGHT, max(1, lines - 3))
+
+
+def _render(
+    snake: list[tuple[int, int]],
+    food: tuple[int, int] | None,
+    score: int,
+    name: str,
+    width: int,
+    height: int,
+    columns: int,
+) -> str:
+    body = set(snake[1:])
+    head = snake[0]
+    border = "+" + "-" * width + "+"
+    lines = [border]
+    for y in range(height):
+        row = []
+        for x in range(width):
+            point = (x, y)
+            if point == head:
+                row.append("■")
+            elif point in body:
+                row.append("■")
+            elif point == food:
+                row.append("◆")
+            else:
+                row.append(" ")
+        lines.append("|" + "".join(row) + "|")
+    lines.append(border)
+    status = f"{name[:8]} Score:{score} WASD/Q"
+    lines.append(status[:columns])
+    return "\n".join(lines)
 
 
 def _draw(
@@ -97,47 +140,34 @@ def _draw(
     food: tuple[int, int] | None,
     score: int,
     name: str,
+    width: int,
+    height: int,
+    columns: int,
 ) -> None:
-    body = set(snake[1:])
-    head = snake[0]
-    border = "+" + "-" * WIDTH + "+"
-    lines = [border]
-    for y in range(HEIGHT):
-        row = []
-        for x in range(WIDTH):
-            point = (x, y)
-            if point == head:
-                row.append("@")
-            elif point in body:
-                row.append("o")
-            elif point == food:
-                row.append("*")
-            else:
-                row.append(" ")
-        lines.append("|" + "".join(row) + "|")
-    lines.append(border)
-    print("\033[H" + "\n".join(lines))
-    print(f"{name}  Score: {score}  (WASD/arrows to move, Q to quit)   ")
+    print(
+        "\033[2J\033[H" + _render(snake, food, score, name, width, height, columns),
+        end="",
+    )
     sys.stdout.flush()
 
 
 def play(name: str) -> tuple[int, bool]:
     """Play one game; return (score, whether the run ended by winning/dying)."""
-    snake = [
-        (WIDTH // 2, HEIGHT // 2),
-        (WIDTH // 2 - 1, HEIGHT // 2),
-        (WIDTH // 2 - 2, HEIGHT // 2),
-    ]
+    columns, terminal_lines = shutil.get_terminal_size(fallback=(80, 24))
+    width, height = _board_size(columns, terminal_lines)
+    snake_length = min(3, width - 1)
+    start_x = min(width // 2, width - 2)
+    snake = [(start_x - index, height // 2) for index in range(snake_length)]
     direction = (1, 0)
-    food = _place_food(snake)
+    food = _place_food_on_board(snake, width, height)
     score = 0
     ended = False
 
-    print("\033[2J\033[H")
+    print("\033[?25l", end="")
     try:
         with Keyboard() as keyboard:
             while True:
-                _draw(snake, food, score, name)
+                _draw(snake, food, score, name, width, height, columns)
                 key = keyboard.read()
                 if key == "q":
                     break
@@ -150,8 +180,8 @@ def play(name: str) -> tuple[int, bool]:
                 growing = next_head == food
                 collision_body = snake if growing else snake[:-1]
                 if (
-                    not 0 <= next_head[0] < WIDTH
-                    or not 0 <= next_head[1] < HEIGHT
+                    not 0 <= next_head[0] < width
+                    or not 0 <= next_head[1] < height
                     or next_head in collision_body
                 ):
                     ended = True
@@ -160,7 +190,7 @@ def play(name: str) -> tuple[int, bool]:
                 snake.insert(0, next_head)
                 if growing:
                     score += 10
-                    food = _place_food(snake)
+                    food = _place_food_on_board(snake, width, height)
                     if food is None:
                         ended = True
                         break
