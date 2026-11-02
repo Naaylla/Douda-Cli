@@ -2,6 +2,8 @@
 
 Play Snake in your terminal.
 
+![Douda gameplay with the shared leaderboard and quit quote](assets/douda-gameplay.png)
+
 ```bash
 pip install douda
 douda
