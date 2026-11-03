@@ -7,8 +7,17 @@ import shutil
 import sys
 import time
 
+from douda.terminal import (
+    color_enabled,
+    pad_visible,
+    plain_mode,
+    truncate_visible,
+    visible_width,
+)
+
 WIDTH = 30
 HEIGHT = 14
+CELL_WIDTH = 2
 _DIRECTIONS = {
     "w": (0, -1),
     "a": (-1, 0),
@@ -100,13 +109,48 @@ def _board_size(columns: int | None = None, lines: int | None = None) -> tuple[i
         columns = terminal.columns if columns is None else columns
         lines = terminal.lines if lines is None else lines
 
+    max_width = max(3, (columns - 2) // CELL_WIDTH)
     available_height = max(1, lines - 15)
-    return min(WIDTH, max(3, columns - 2)), min(HEIGHT, available_height)
+    return min(WIDTH, max_width), min(HEIGHT, available_height)
 
 
 def _movement_delay(score: int, direction: tuple[int, int]) -> float:
     delay = max(0.055, 0.13 - score * 0.0007)
     return delay * 1.5 if direction[1] else delay
+
+
+def _leaderboard_row(
+    rank: object, name: object, score: object, inner_width: int
+) -> str:
+    rank_text = f"{rank}."
+    score_text = str(score)
+    rank_width = max(2, visible_width(rank_text))
+    score_width = max(
+        4,
+        min(
+            max(4, inner_width - rank_width - 5),
+            visible_width(score_text),
+        ),
+    )
+    name_width = inner_width - rank_width - score_width - 4
+    if name_width < 1:
+        name_width = 1
+    name_field = pad_visible(
+        truncate_visible(str(name), name_width), name_width
+    )
+    score_field = pad_visible(
+        truncate_visible(score_text, score_width), score_width, "right"
+    )
+    content = (
+        " "
+        + pad_visible(rank_text, rank_width)
+        + " "
+        + name_field
+        + " "
+        + score_field
+        + " "
+    )
+    return pad_visible(content, inner_width)
 
 
 def _render(
@@ -121,21 +165,31 @@ def _render(
     top_padding: int = 0,
     color: bool = False,
     player_position: dict[str, object] | None = None,
+    plain: bool | None = None,
+    leaderboard_loading: bool = False,
 ) -> str:
+    if plain is None:
+        plain = plain_mode()
+    if plain:
+        color = False
+
     def paint(text: str, code: str) -> str:
         return f"\033[{code}m{text}\033[0m" if color else text
 
     encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-    try:
-        "■".encode(encoding)
-        snake_glyph = "■"
-    except UnicodeEncodeError:
+    if plain:
         snake_glyph = "#"
-    try:
-        "◆".encode(encoding)
-        food_glyph = "◆"
-    except UnicodeEncodeError:
-        food_glyph = "*"
+        food_glyph = "o"
+    else:
+        try:
+            "█".encode(encoding)
+            snake_glyph = "█"
+        except UnicodeEncodeError:
+            snake_glyph = "#"
+        if snake_glyph == "█":
+            food_glyph = "█" if color else "▓"
+        else:
+            food_glyph = "*"
 
     title_letters = {
         "D": (".__. ", "|   \\", "|   |", "|   /", "|___/"),
@@ -158,71 +212,96 @@ def _render(
 
     body = set(snake[1:])
     head = snake[0]
-    border = "+" + "-" * width + "+"
+    board_width = width * CELL_WIDTH
+    border = "+" + "-" * board_width + "+"
     board_lines = [paint(border, "36")]
     for y in range(height):
         row = []
         for x in range(width):
             point = (x, y)
             if point == head:
-                row.append(paint(snake_glyph, "1;32"))
+                row.append(paint(snake_glyph * CELL_WIDTH, "1;32"))
             elif point in body:
-                row.append(paint(snake_glyph, "32"))
+                row.append(paint(snake_glyph * CELL_WIDTH, "32"))
             elif point == food:
-                row.append(paint(food_glyph, "1;33"))
+                row.append(paint(food_glyph * CELL_WIDTH, "1;33"))
             else:
-                row.append(" ")
+                row.append(" " * CELL_WIDTH)
         board_lines.append("|" + "".join(row) + "|")
     board_lines.append(paint(border, "36"))
-    score_text = f" SCORE  {score:04d} " if width >= 11 else str(score)
-    score_line = "|" + score_text.center(width) + "|"
+    score_text = f" SCORE  {score:04d} " if board_width >= 13 else str(score)
+    score_line = "|" + pad_visible(score_text, board_width, "center") + "|"
+    help_text = " WASD / ARROWS MOVE  Q QUIT "
+    if visible_width(help_text) > board_width + 2:
+        help_text = truncate_visible(help_text, board_width + 2)
     board_lines.extend(
         [
             paint(border, "36"),
             paint(score_line, "1;33"),
             paint(border, "36"),
-            paint(
-                " WASD / ARROWS MOVE  Q QUIT "[: width + 2].center(width + 2),
-                "2;37",
-            ),
+            paint(pad_visible(help_text, board_width + 2, "center"), "2;37"),
         ]
     )
 
     panel_width = 28
+    panel_inner = panel_width - 2
+    panel_border = "+" + "-" * panel_inner + "+"
     panel_lines = [
-        paint("+" + "-" * (panel_width - 2) + "+", "36"),
-        paint("|" + "  LEADERBOARD".center(panel_width - 2) + "|", "1;36"),
-        paint("+" + "-" * (panel_width - 2) + "+", "36"),
+        paint(panel_border, "36"),
+        paint("|" + pad_visible("LEADERBOARD", panel_inner, "center") + "|", "1;36"),
+        paint(panel_border, "36"),
     ]
-    try:
-        "♛".encode(encoding)
-        crown = "♛"
-    except UnicodeEncodeError:
-        crown = "*"
-    crown_colors = ("33", "37", "31")
+    rank_colors = ("33", "37", "31")
+    player_rank = 0
+    if player_position:
+        try:
+            player_rank = int(player_position.get("rank", 0))
+        except (TypeError, ValueError, OverflowError):
+            player_rank = 0
     if top_scores:
-        for rank, entry in enumerate(top_scores[:3], start=1):
-            player_name = str(entry.get("name", "Player"))[:12]
-            player_score = str(entry.get("score", 0))[-6:]
-            row = f"| {crown}{rank} {player_name:<11} {player_score:>6} |"
-            panel_lines.append(paint(row, crown_colors[rank - 1]))
+        for index, entry in enumerate(top_scores[:7], start=1):
+            rank = entry.get("rank", index)
+            player_name = str(entry.get("name", "Player"))
+            player_score = entry.get("score", 0)
+            try:
+                is_current_player = int(rank) == player_rank
+            except (TypeError, ValueError, OverflowError):
+                is_current_player = False
+            if is_current_player:
+                player_name = "YOU"
+            row = "|" + _leaderboard_row(
+                rank, player_name, player_score, panel_inner
+            ) + "|"
+            panel_lines.append(paint(row, rank_colors[index - 1] if index <= 3 else "37"))
     else:
-        panel_lines.append("|  No scores yet            |")
-        panel_lines.append("|  Be the first!            |")
-    panel_lines.append(paint("+" + "-" * (panel_width - 2) + "+", "36"))
-    if player_position and player_position.get("rank", 0) > 3:
-        position = f"YOU ARE #{player_position['rank']} · {player_position['score']} pts"
-        panel_lines.append(
-            paint(
-                "|" + f" {position[:panel_width - 4]}".ljust(panel_width - 2) + "|",
-                "1;32",
+        if leaderboard_loading:
+            panel_lines.append(
+                "|" + pad_visible(" Loading leaderboard...", panel_inner) + "|"
             )
-        )
-        panel_lines.append(paint("+" + "-" * (panel_width - 2) + "+", "36"))
+            panel_lines.append(
+                "|" + pad_visible(" Please wait", panel_inner) + "|"
+            )
+        else:
+            panel_lines.append("|" + pad_visible(" No scores yet", panel_inner) + "|")
+            panel_lines.append("|" + pad_visible(" Be the first!", panel_inner) + "|")
 
-    show_panel = columns >= width + 2 + 4 + panel_width
+    if player_position and player_rank > 7:
+        panel_lines.append(
+            "|" + pad_visible("...", panel_inner, "center") + "|"
+        )
+        row = "|" + _leaderboard_row(
+            player_position.get("rank", "?"),
+            "YOU",
+            player_position.get("score", 0),
+            panel_inner,
+        ) + "|"
+        panel_lines.append(paint(row, "1;32"))
+    panel_lines.append(paint(panel_border, "36"))
+
+    board_rendered_width = board_width + 2
+    show_panel = columns >= board_rendered_width + 4 + panel_width
     if show_panel:
-        content_width = width + 2 + 4 + panel_width
+        content_width = board_rendered_width + 4 + panel_width
         left_padding = max(0, (columns - content_width) // 2)
         content_lines = []
         for index in range(max(len(board_lines), len(panel_lines))):
@@ -230,12 +309,12 @@ def _render(
             panel_line = panel_lines[index] if index < len(panel_lines) else ""
             content_lines.append(
                 " " * left_padding
-                + board_line.ljust(width + 2)
+                + pad_visible(board_line, board_rendered_width)
                 + " " * 4
                 + panel_line
             )
     else:
-        left_padding = max(0, (columns - (width + 2)) // 2)
+        left_padding = max(0, (columns - board_rendered_width) // 2)
         content_lines = [" " * left_padding + line for line in board_lines]
 
     return "\n" * top_padding + "\n".join(header + [""] + content_lines)
@@ -253,24 +332,28 @@ def _draw(
     top_padding: int,
     color: bool,
     player_position: dict[str, object] | None,
+    plain: bool | None = None,
+    leaderboard_loading: bool = False,
 ) -> None:
-    print(
-        "\033[H\033[J"
-        + _render(
-            snake,
-            food,
-            score,
-            name,
-            width,
-            height,
-            columns,
-            top_scores,
-            top_padding,
-            color,
-            player_position,
-        ),
-        end="",
+    frame = _render(
+        snake,
+        food,
+        score,
+        name,
+        width,
+        height,
+        columns,
+        top_scores,
+        top_padding,
+        color,
+        player_position,
+        plain,
+        leaderboard_loading,
     )
+    if plain:
+        print(frame + "\n", end="")
+    else:
+        print("\033[H\033[J" + frame, end="")
     sys.stdout.flush()
 
 
@@ -278,12 +361,14 @@ def play(
     name: str,
     top_scores: list[dict[str, object]] | None = None,
     player_position: dict[str, object] | None = None,
+    leaderboard: object | None = None,
 ) -> tuple[int, bool]:
     """Play one game; return (score, whether the run ended by winning/dying)."""
     columns, terminal_lines = shutil.get_terminal_size(fallback=(80, 24))
     width, height = _board_size(columns, terminal_lines)
     top_padding = min(2, max(0, terminal_lines - height - 5))
-    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    color = color_enabled(sys.stdout)
+    plain = plain_mode()
     snake_length = min(3, width - 1)
     start_x = min(width // 2, width - 2)
     snake = [(start_x - index, height // 2) for index in range(snake_length)]
@@ -292,10 +377,17 @@ def play(
     score = 0
     ended = False
 
-    print("\033[?25l", end="")
+    if not plain:
+        print("\033[?25l", end="")
     try:
         with Keyboard() as keyboard:
             while True:
+                leaderboard_loading = False
+                if leaderboard is not None:
+                    top_scores, player_position = leaderboard.snapshot()
+                    is_loading = getattr(leaderboard, "is_loading", None)
+                    if callable(is_loading):
+                        leaderboard_loading = bool(is_loading())
                 _draw(
                     snake,
                     food,
@@ -308,6 +400,8 @@ def play(
                     top_padding,
                     color,
                     player_position,
+                    plain,
+                    leaderboard_loading,
                 )
                 key = keyboard.read()
                 if key == "q":
@@ -340,7 +434,8 @@ def play(
 
                 time.sleep(_movement_delay(score, direction))
     finally:
-        print("\033[?25h")
+        if not plain:
+            print("\033[?25h")
 
     return score, ended
 

@@ -71,7 +71,11 @@ class LeaderboardStore:
             )
 
     def page(
-        self, limit: int, offset: int, player_name: str | None = None
+        self,
+        limit: int,
+        offset: int,
+        player_name: str | None = None,
+        score_id: int | None = None,
     ) -> tuple[int, list[dict[str, object]], dict[str, object] | None]:
         if self._pool is None:
             with _database(self._db_path) as connection:
@@ -88,7 +92,21 @@ class LeaderboardStore:
                     (limit, offset),
                 ).fetchall()
                 player_row = None
-                if player_name:
+                if score_id is not None:
+                    player_row = connection.execute(
+                        """
+                        SELECT name, score, rank
+                        FROM (
+                            SELECT id, name, score,
+                                ROW_NUMBER() OVER (ORDER BY score DESC, id ASC) AS rank
+                            FROM scores
+                        ) ranked
+                        WHERE id = ?
+                        LIMIT 1
+                        """,
+                        (score_id,),
+                    ).fetchone()
+                elif player_name:
                     player_row = connection.execute(
                         """
                         SELECT name, score, rank
@@ -135,7 +153,21 @@ class LeaderboardStore:
                 (limit, offset),
             ).fetchall()
             player_row = None
-            if player_name:
+            if score_id is not None:
+                player_row = connection.execute(
+                    """
+                    SELECT name, score, rank
+                    FROM (
+                        SELECT id, name, score,
+                            ROW_NUMBER() OVER (ORDER BY score DESC, id ASC) AS rank
+                        FROM douda_scores
+                    ) ranked
+                    WHERE id = %s
+                    LIMIT 1
+                    """,
+                    (score_id,),
+                ).fetchone()
+            elif player_name:
                 player_row = connection.execute(
                     """
                     SELECT name, score, rank
@@ -266,7 +298,21 @@ def create_server(
                     )
                     return
 
-            total, scores, player = store.page(limit, offset, player_name)
+            score_id: int | None = None
+            raw_score_id = query.get("score_id", [None])[0]
+            if raw_score_id is not None:
+                try:
+                    score_id = int(raw_score_id)
+                except ValueError:
+                    self._send_json(400, {"error": "score_id must be an integer"})
+                    return
+                if score_id < 1:
+                    self._send_json(400, {"error": "score_id must be positive"})
+                    return
+
+            total, scores, player = store.page(
+                limit, offset, player_name, score_id
+            )
             self._send_json(
                 200,
                 {

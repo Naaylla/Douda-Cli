@@ -6,10 +6,17 @@ import os
 import random
 import sys
 
-from douda.game import play, wait_for_replay
-from douda.leaderboard import LeaderboardError, get_scores, submit_score
+from douda import terminal
+from douda.game import _leaderboard_row, play, wait_for_replay
+from douda.leaderboard import (
+    LeaderboardCache,
+    LeaderboardError,
+    get_scores,
+    submit_score,
+)
 
 DEFAULT_LEADERBOARD_URL = "https://douda-cli.onrender.com"
+LEADERBOARD_LIMIT = 7
 _QUIT_QUOTES = (
     "You died in a rectangle. Your ancestors are so confused.",
     "The snake has left the chat. It was never invited.",
@@ -30,13 +37,17 @@ def _leaderboard_url() -> str:
 
 def _print_quit_quote() -> None:
     quote = random.choice(_QUIT_QUOTES)
-    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-    try:
-        "✨".encode(encoding)
-        sparkle = "✨"
-    except UnicodeEncodeError:
+    plain = terminal.plain_mode()
+    color = terminal.color_enabled(sys.stdout)
+    if plain:
         sparkle = "*"
-    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    else:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        try:
+            "✨".encode(encoding)
+            sparkle = "✨"
+        except (LookupError, UnicodeEncodeError):
+            sparkle = "*"
     print(
         f"{_paint(sparkle, '1;33', color)} "
         f"{_paint(quote, '1;35', color)} "
@@ -48,6 +59,10 @@ def _paint(text: str, color: str, enabled: bool) -> str:
     if not enabled:
         return text
     return f"\033[{color}m{text}\033[0m"
+
+
+def _box_row(content: str, inner_width: int) -> str:
+    return "|" + terminal.pad_visible(content, inner_width) + "|"
 
 
 def _print_leaderboard(
@@ -65,38 +80,50 @@ def _print_leaderboard(
 
     scores = result.get("scores", [])
     player = result.get("player")
-    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    color = terminal.color_enabled(sys.stdout)
     width = 40
-    border = "+" + "-" * (width - 2) + "+"
+    inner_width = width - 2
+    border = "+" + "-" * inner_width + "+"
+    shown_limit = min(limit, LEADERBOARD_LIMIT)
 
     print(_paint(border, "36", color))
-    title = f"  DOUDA  /  GLOBAL TOP {limit}"
-    print(_paint("|" + title.center(width - 2) + "|", "1;36", color))
+    title = f"  DOUDA  /  GLOBAL TOP {shown_limit}"
+    print(_paint(_box_row(title, inner_width), "1;36", color))
     print(_paint(border, "36", color))
 
     if not scores:
-        print("|" + "  No scores yet — go play!".ljust(width - 2) + "|")
+        print(_paint(_box_row("  No scores yet - go play!", inner_width), "36", color))
     else:
-        for index, entry in enumerate(scores, start=1):
+        rank_colors = ("33", "37", "31")
+        for index, entry in enumerate(scores[:shown_limit], start=1):
             rank = entry.get("rank", index)
-            name = str(entry.get("name", "Player"))[:18]
+            name = entry.get("name", "Player")
             score = entry.get("score", 0)
-            row = f"|  #{rank:<2} {name:<18} {score:>8} pts  |"
-            color_code = ("33", "37", "31")[min(index - 1, 2)]
-            print(_paint(row, color_code, color))
+            row = _box_row(
+                _leaderboard_row(rank, name, score, inner_width), inner_width
+            )
+            print(_paint(row, rank_colors[min(index - 1, 2)], color))
+
+    player_rank = 0
+    if player:
+        try:
+            player_rank = int(player.get("rank", 0))
+        except (TypeError, ValueError):
+            player_rank = 0
+    if player and player_rank > shown_limit:
+        print(_paint(_box_row("...", inner_width), "36", color))
+        player_row = _box_row(
+            _leaderboard_row(
+                player.get("rank", "?"),
+                player.get("name", player_name or "You"),
+                player.get("score", 0),
+                inner_width,
+            ),
+            inner_width,
+        )
+        print(_paint(player_row, "1;32", color))
 
     print(_paint(border, "36", color))
-    if player_name:
-        if player:
-            rank = player["rank"]
-            best_score = player["score"]
-            personal = f"|  YOUR BEST   #{rank}  ·  {best_score} pts"
-        else:
-            personal = f"|  {player_name[:12]}: no score yet — go play"
-        print(_paint(personal.ljust(width - 1) + "|", "1;32", color))
-        print(_paint(border, "36", color))
-    else:
-        print(f"Set DOUDA_PLAYER or use `douda leaderboard --player NAME` for your rank.")
     return 0
 
 
@@ -105,91 +132,100 @@ def main() -> None:
         prog="douda",
         description="Play terminal Snake and climb the shared leaderboard.",
     )
-    parser.add_argument("--name", help="leaderboard name (1-24 characters)")
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="disable colors and Unicode (ASCII-only mode)",
+    )
     subparsers = parser.add_subparsers(dest="command")
     leaderboard_parser = subparsers.add_parser(
         "leaderboard", help="show the top scores and your best rank"
     )
-    leaderboard_parser.add_argument("--player", help="your leaderboard name")
-    leaderboard_parser.add_argument("--limit", type=int, default=3)
+    leaderboard_parser.add_argument("--player", help="show this player's rank")
+    leaderboard_parser.add_argument("--limit", type=int, default=LEADERBOARD_LIMIT)
     leaderboard_parser.add_argument("--offset", type=int, default=0)
+    leaderboard_parser.add_argument(
+        "--plain",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="disable colors and Unicode (ASCII-only mode)",
+    )
     args = parser.parse_args()
+    terminal.configure(getattr(args, "plain", False))
 
     if args.command == "leaderboard":
         if not 1 <= args.limit <= 100 or args.offset < 0:
             parser.error("--limit must be 1-100 and --offset must be non-negative")
-        player_name = args.player or os.environ.get("DOUDA_PLAYER")
-        if not player_name:
-            try:
-                player_name = input("Your leaderboard name: ")
-            except EOFError:
-                player_name = None
-        if player_name:
-            player_name = player_name.strip()
-            if (
-                not player_name
-                or len(player_name) > 24
-                or any(
-                    ord(character) < 32 or ord(character) == 127
-                    for character in player_name
-                )
-            ):
-                parser.error(
-                    "player name must be 1-24 characters without control characters"
-                )
         raise SystemExit(
             _print_leaderboard(
-                _leaderboard_url(), args.limit, args.offset, player_name
+                _leaderboard_url(), args.limit, args.offset, args.player
             )
         )
 
-    name = args.name or os.environ.get("DOUDA_PLAYER")
-    if not name:
-        try:
-            name = input("Player name for the leaderboard (max 24 characters): ")
-        except EOFError:
-            name = "Player"
-    name = name.strip() or "Player"
-    if len(name) > 24 or any(
-        ord(character) < 32 or ord(character) == 127 for character in name
-    ):
-        parser.error("player name must be 1-24 characters without control characters")
+    leaderboard_url = _leaderboard_url()
+    leaderboard = LeaderboardCache(
+        leaderboard_url, "", limit=LEADERBOARD_LIMIT, loader=get_scores
+    )
+    leaderboard.refresh()
+    top_scores, player_position = leaderboard.snapshot()
+    name: str | None = None
 
-    try:
-        leaderboard = get_scores(
-            _leaderboard_url(), limit=3, player_name=name
-        )
-        top_scores = leaderboard.get("scores", [])
-        player_position = leaderboard.get("player")
-    except LeaderboardError as exc:
-        print(f"Leaderboard unavailable for this run: {exc}", file=sys.stderr)
-        top_scores = []
-        player_position = None
-
-    print("Starting Douda — press WASD or arrow keys to move; Q quits.")
+    print("Starting Douda - press WASD or arrow keys to move; Q quits.")
     while True:
-        score, ended = play(name, top_scores, player_position)
+        leaderboard.refresh()
+        score, ended = play(
+            name or "Player",
+            top_scores,
+            player_position,
+            leaderboard=leaderboard,
+        )
         if not ended:
             print(f"Quit. Final score: {score}")
             _print_quit_quote()
             return
 
         print(f"Game over! Final score: {score}")
+        if name is None:
+            while True:
+                try:
+                    entered_name = input(
+                        "Enter your leaderboard name (1-24 characters): "
+                    ).strip()
+                except EOFError:
+                    entered_name = "Player"
+                if entered_name and len(entered_name) <= 24 and all(
+                    ord(character) >= 32 and ord(character) != 127
+                    for character in entered_name
+                ):
+                    name = entered_name
+                    break
+                print(
+                    "Name must be 1-24 characters without control characters.",
+                    file=sys.stderr,
+                )
+        assert name is not None
+        leaderboard = LeaderboardCache(
+            leaderboard_url, name, limit=LEADERBOARD_LIMIT, loader=get_scores
+        )
         try:
-            submit_score(_leaderboard_url(), name, score)
+            submitted = submit_score(leaderboard_url, name, score)
         except LeaderboardError as exc:
             print(f"Could not submit score: {exc}", file=sys.stderr)
             print(
-                "Your run is over, but the score was not saved. "
-                "Start the server or check DOUDA_LEADERBOARD_URL.",
+                "The score may have been received, but its submission was not "
+                "confirmed. Check the leaderboard before trying to submit it again.",
                 file=sys.stderr,
             )
         else:
+            score_id = submitted.get("id")
+            if isinstance(score_id, int):
+                leaderboard.focus_score(score_id)
             print("Score submitted to the shared leaderboard!")
+        leaderboard.refresh()
         if not wait_for_replay():
             _print_quit_quote()
             return
-        print("Starting another run — press WASD or arrow keys to move; Q quits.")
+        print("Starting another run - press WASD or arrow keys to move; Q quits.")
 
 
 if __name__ == "__main__":
