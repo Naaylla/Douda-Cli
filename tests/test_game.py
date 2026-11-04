@@ -254,11 +254,12 @@ class GameDisplayTests(unittest.TestCase):
             plain=False,
         )
 
-        self.assertIn("...", frame)
-        self.assertIn("3000. YOU", frame)
+        self.assertIn("|            .             |", frame)
+        self.assertEqual(frame.count("|            .             |"), 3)
+        self.assertIn("3000. Player", frame)
         self.assertNotIn("YOU ARE", frame)
 
-    def test_sidebar_shows_top_seven_and_personal_rank_below_them(self) -> None:
+    def test_sidebar_shows_top_five_then_personal_rank_with_ellipsis(self) -> None:
         frame = _render(
             snake=[(1, 1)],
             food=(2, 1),
@@ -271,16 +272,39 @@ class GameDisplayTests(unittest.TestCase):
                 {"rank": rank, "name": f"Player{rank}", "score": 100 - rank}
                 for rank in range(1, 8)
             ],
-            player_position={"rank": 50, "score": 20},
+            player_position={"rank": 50, "name": "Nayla", "score": 20},
             plain=True,
         )
 
-        for rank in range(1, 8):
+        for rank in range(1, 6):
             self.assertIn(f"{rank}. Player{rank}", frame)
-        self.assertIn("50. YOU", frame)
-        self.assertIn("...", frame)
+        for rank in range(6, 8):
+            self.assertNotIn(f"{rank}. Player{rank}", frame)
+        self.assertIn("50. Nayla", frame)
+        self.assertEqual(frame.count("|            .             |"), 3)
 
-    def test_sidebar_omits_personal_position_for_top_three_player(self) -> None:
+    def test_sidebar_highlights_the_player_inside_the_top_five(self) -> None:
+        reset()
+        self.addCleanup(reset)
+        frame = _render(
+            snake=[(1, 1)],
+            food=(2, 1),
+            score=90,
+            name="Ada",
+            width=8,
+            height=3,
+            columns=80,
+            top_scores=[
+                {"rank": 1, "name": "Lin", "score": 100},
+                {"rank": 2, "name": "Ada", "score": 90},
+            ],
+            player_position={"rank": 2, "name": "Ada", "score": 90},
+            color=True,
+        )
+
+        self.assertIn("\033[1;32m| 2. Ada", frame)
+
+    def test_sidebar_omits_personal_position_for_top_five_player(self) -> None:
         frame = _render(
             snake=[(1, 1)],
             food=(2, 1),
@@ -293,7 +317,7 @@ class GameDisplayTests(unittest.TestCase):
             player_position={"rank": 1, "score": 90},
         )
 
-        self.assertIn("1. YOU", frame)
+        self.assertIn("1. Ada", frame)
         self.assertNotIn("YOUR POSITION", frame)
 
     def test_render_hides_sidebar_when_terminal_is_narrow(self) -> None:

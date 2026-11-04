@@ -18,6 +18,7 @@ from douda.terminal import (
 WIDTH = 30
 HEIGHT = 14
 CELL_WIDTH = 2
+LEADERBOARD_ROWS = 5
 _DIRECTIONS = {
     "w": (0, -1),
     "a": (-1, 0),
@@ -251,7 +252,7 @@ def _render(
         paint("|" + pad_visible("LEADERBOARD", panel_inner, "center") + "|", "1;36"),
         paint(panel_border, "36"),
     ]
-    rank_colors = ("33", "37", "31")
+    rank_colors = ("33", "37", "31", "37", "37")
     player_rank = 0
     if player_position:
         try:
@@ -259,7 +260,7 @@ def _render(
         except (TypeError, ValueError, OverflowError):
             player_rank = 0
     if top_scores:
-        for index, entry in enumerate(top_scores[:7], start=1):
+        for index, entry in enumerate(top_scores[:LEADERBOARD_ROWS], start=1):
             rank = entry.get("rank", index)
             player_name = str(entry.get("name", "Player"))
             player_score = entry.get("score", 0)
@@ -267,12 +268,12 @@ def _render(
                 is_current_player = int(rank) == player_rank
             except (TypeError, ValueError, OverflowError):
                 is_current_player = False
-            if is_current_player:
-                player_name = "YOU"
             row = "|" + _leaderboard_row(
                 rank, player_name, player_score, panel_inner
             ) + "|"
-            panel_lines.append(paint(row, rank_colors[index - 1] if index <= 3 else "37"))
+            panel_lines.append(
+                paint(row, "1;32" if is_current_player else rank_colors[index - 1])
+            )
     else:
         if leaderboard_loading:
             panel_lines.append(
@@ -285,13 +286,14 @@ def _render(
             panel_lines.append("|" + pad_visible(" No scores yet", panel_inner) + "|")
             panel_lines.append("|" + pad_visible(" Be the first!", panel_inner) + "|")
 
-    if player_position and player_rank > 7:
-        panel_lines.append(
-            "|" + pad_visible("...", panel_inner, "center") + "|"
+    if player_position and player_rank > LEADERBOARD_ROWS:
+        panel_lines.extend(
+            "|" + pad_visible(".", panel_inner, "center") + "|"
+            for _ in range(3)
         )
         row = "|" + _leaderboard_row(
             player_position.get("rank", "?"),
-            "YOU",
+            player_position.get("name", name),
             player_position.get("score", 0),
             panel_inner,
         ) + "|"

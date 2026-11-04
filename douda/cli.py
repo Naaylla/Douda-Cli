@@ -5,6 +5,7 @@ import argparse
 import os
 import random
 import sys
+from pathlib import Path
 
 from douda import terminal
 from douda.game import _leaderboard_row, play, wait_for_replay
@@ -16,7 +17,7 @@ from douda.leaderboard import (
 )
 
 DEFAULT_LEADERBOARD_URL = "https://douda-cli.onrender.com"
-LEADERBOARD_LIMIT = 7
+LEADERBOARD_LIMIT = 5
 _QUIT_QUOTES = (
     "You died in a rectangle. Your ancestors are so confused.",
     "The snake has left the chat. It was never invited.",
@@ -33,6 +34,37 @@ def _leaderboard_url() -> str:
     return os.environ.get(
         "DOUDA_LEADERBOARD_URL", DEFAULT_LEADERBOARD_URL
     ).rstrip("/")
+
+
+def _saved_player_name_path() -> Path:
+    if os.name == "nt":
+        config_home = Path(os.environ.get("APPDATA", Path.home()))
+    else:
+        config_home = Path(
+            os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+        )
+    return config_home / "douda" / "player-name"
+
+
+def _load_saved_player_name() -> str | None:
+    try:
+        name = _saved_player_name_path().read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        print(f"Could not read saved leaderboard name: {exc}", file=sys.stderr)
+        return None
+    if name and len(name) <= 24 and all(
+        ord(character) >= 32 and ord(character) != 127 for character in name
+    ):
+        return name
+    return None
+
+
+def _save_player_name(name: str) -> None:
+    path = _saved_player_name_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(name, encoding="utf-8")
 
 
 def _print_quit_quote() -> None:
@@ -61,15 +93,16 @@ def _paint(text: str, color: str, enabled: bool) -> str:
     return f"\033[{color}m{text}\033[0m"
 
 
-def _box_row(content: str, inner_width: int) -> str:
-    return "|" + terminal.pad_visible(content, inner_width) + "|"
+def _box_row(content: str, inner_width: int, align: str = "left") -> str:
+    return "|" + terminal.pad_visible(content, inner_width, align) + "|"
 
 
 def _print_leaderboard(
     url: str, limit: int, offset: int, player_name: str | None
 ) -> int:
+    shown_limit = min(limit, LEADERBOARD_LIMIT)
     try:
-        result = get_scores(url, limit, offset, player_name)
+        result = get_scores(url, shown_limit, offset, player_name)
     except LeaderboardError as exc:
         print(f"Leaderboard error: {exc}", file=sys.stderr)
         print(
@@ -84,7 +117,6 @@ def _print_leaderboard(
     width = 40
     inner_width = width - 2
     border = "+" + "-" * inner_width + "+"
-    shown_limit = min(limit, LEADERBOARD_LIMIT)
 
     print(_paint(border, "36", color))
     title = f"  DOUDA  /  GLOBAL TOP {shown_limit}"
@@ -111,7 +143,8 @@ def _print_leaderboard(
         except (TypeError, ValueError):
             player_rank = 0
     if player and player_rank > shown_limit:
-        print(_paint(_box_row("...", inner_width), "36", color))
+        for _ in range(3):
+            print(_paint(_box_row(".", inner_width, "center"), "36", color))
         player_row = _box_row(
             _leaderboard_row(
                 player.get("rank", "?"),
@@ -156,19 +189,20 @@ def main() -> None:
     if args.command == "leaderboard":
         if not 1 <= args.limit <= 100 or args.offset < 0:
             parser.error("--limit must be 1-100 and --offset must be non-negative")
+        player_name = args.player or _load_saved_player_name()
         raise SystemExit(
             _print_leaderboard(
-                _leaderboard_url(), args.limit, args.offset, args.player
+                _leaderboard_url(), args.limit, args.offset, player_name
             )
         )
 
     leaderboard_url = _leaderboard_url()
+    name = _load_saved_player_name()
     leaderboard = LeaderboardCache(
-        leaderboard_url, "", limit=LEADERBOARD_LIMIT, loader=get_scores
+        leaderboard_url, name or "", limit=LEADERBOARD_LIMIT, loader=get_scores
     )
     leaderboard.refresh()
     top_scores, player_position = leaderboard.snapshot()
-    name: str | None = None
 
     print("Starting Douda - press WASD or arrow keys to move; Q quits.")
     while True:
@@ -203,10 +237,12 @@ def main() -> None:
                     "Name must be 1-24 characters without control characters.",
                     file=sys.stderr,
                 )
-        assert name is not None
-        leaderboard = LeaderboardCache(
-            leaderboard_url, name, limit=LEADERBOARD_LIMIT, loader=get_scores
-        )
+            try:
+                _save_player_name(name)
+            except OSError as exc:
+                print(f"Could not save your leaderboard name: {exc}", file=sys.stderr)
+            leaderboard.set_player_name(name)
+        print("Submitting score...")
         try:
             submitted = submit_score(leaderboard_url, name, score)
         except LeaderboardError as exc:

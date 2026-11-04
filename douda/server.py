@@ -7,7 +7,7 @@ import sqlite3
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 from urllib.parse import parse_qs, urlsplit
 
 from psycopg_pool import ConnectionPool
@@ -32,6 +32,12 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS scores_order ON scores(score DESC, id ASC)"
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS scores_player
+        ON scores(lower(name), score DESC, id ASC)
+        """
     )
     return connection
 
@@ -69,6 +75,12 @@ class LeaderboardStore:
                 ON douda_scores(score DESC, id ASC)
                 """
             )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS douda_scores_player
+                ON douda_scores(lower(name), score DESC, id ASC)
+                """
+            )
 
     def page(
         self,
@@ -76,12 +88,15 @@ class LeaderboardStore:
         offset: int,
         player_name: str | None = None,
         score_id: int | None = None,
-    ) -> tuple[int, list[dict[str, object]], dict[str, object] | None]:
+        include_total: bool = False,
+    ) -> tuple[int | None, list[dict[str, object]], dict[str, object] | None]:
         if self._pool is None:
             with _database(self._db_path) as connection:
-                total = connection.execute(
-                    "SELECT COUNT(*) FROM scores"
-                ).fetchone()[0]
+                total = None
+                if include_total:
+                    total = connection.execute(
+                        "SELECT COUNT(*) FROM scores"
+                    ).fetchone()[0]
                 rows = connection.execute(
                     """
                     SELECT name, score, created_at
@@ -93,34 +108,9 @@ class LeaderboardStore:
                 ).fetchall()
                 player_row = None
                 if score_id is not None:
-                    player_row = connection.execute(
-                        """
-                        SELECT name, score, rank
-                        FROM (
-                            SELECT id, name, score,
-                                ROW_NUMBER() OVER (ORDER BY score DESC, id ASC) AS rank
-                            FROM scores
-                        ) ranked
-                        WHERE id = ?
-                        LIMIT 1
-                        """,
-                        (score_id,),
-                    ).fetchone()
+                    player_row = self._rank_for_score_sqlite(connection, score_id)
                 elif player_name:
-                    player_row = connection.execute(
-                        """
-                        SELECT name, score, rank
-                        FROM (
-                            SELECT id, name, score,
-                                ROW_NUMBER() OVER (ORDER BY score DESC, id ASC) AS rank
-                            FROM scores
-                        ) ranked
-                        WHERE lower(name) = lower(?)
-                        ORDER BY score DESC, id ASC
-                        LIMIT 1
-                        """,
-                        (player_name,),
-                    ).fetchone()
+                    player_row = self._rank_for_name_sqlite(connection, player_name)
             return total, [
                 {
                     "rank": offset + index + 1,
@@ -129,20 +119,14 @@ class LeaderboardStore:
                     "created_at": row["created_at"],
                 }
                 for index, row in enumerate(rows)
-            ], (
-                {
-                    "name": player_row["name"],
-                    "score": player_row["score"],
-                    "rank": player_row["rank"],
-                }
-                if player_row
-                else None
-            )
+            ], player_row
 
         with self._pool.connection() as connection:
-            total = connection.execute(
-                "SELECT COUNT(*) FROM douda_scores"
-            ).fetchone()[0]
+            total = None
+            if include_total:
+                total = connection.execute(
+                    "SELECT COUNT(*) FROM douda_scores"
+                ).fetchone()[0]
             rows = connection.execute(
                 """
                 SELECT name, score, created_at
@@ -154,34 +138,9 @@ class LeaderboardStore:
             ).fetchall()
             player_row = None
             if score_id is not None:
-                player_row = connection.execute(
-                    """
-                    SELECT name, score, rank
-                    FROM (
-                        SELECT id, name, score,
-                            ROW_NUMBER() OVER (ORDER BY score DESC, id ASC) AS rank
-                        FROM douda_scores
-                    ) ranked
-                    WHERE id = %s
-                    LIMIT 1
-                    """,
-                    (score_id,),
-                ).fetchone()
+                player_row = self._rank_for_score_postgres(connection, score_id)
             elif player_name:
-                player_row = connection.execute(
-                    """
-                    SELECT name, score, rank
-                    FROM (
-                        SELECT id, name, score,
-                            ROW_NUMBER() OVER (ORDER BY score DESC, id ASC) AS rank
-                        FROM douda_scores
-                    ) ranked
-                    WHERE lower(name) = lower(%s)
-                    ORDER BY score DESC, id ASC
-                    LIMIT 1
-                    """,
-                    (player_name,),
-                ).fetchone()
+                player_row = self._rank_for_name_postgres(connection, player_name)
         return (
             total,
             [
@@ -193,16 +152,100 @@ class LeaderboardStore:
                 }
                 for index, row in enumerate(rows)
             ],
-            (
-                {
-                    "name": player_row[0],
-                    "score": player_row[1],
-                    "rank": player_row[2],
-                }
-                if player_row
-                else None
-            ),
+            player_row,
         )
+
+    @staticmethod
+    def _rank_for_score_sqlite(
+        connection: sqlite3.Connection, score_id: int
+    ) -> dict[str, object] | None:
+        row = connection.execute(
+            "SELECT name, score, id FROM scores WHERE id = ? LIMIT 1",
+            (score_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        rank = connection.execute(
+            """
+            SELECT COUNT(*) + 1
+            FROM scores
+            WHERE score > ? OR (score = ? AND id < ?)
+            """,
+            (row["score"], row["score"], row["id"]),
+        ).fetchone()[0]
+        return {"name": row["name"], "score": row["score"], "rank": rank}
+
+    @staticmethod
+    def _rank_for_name_sqlite(
+        connection: sqlite3.Connection, player_name: str
+    ) -> dict[str, object] | None:
+        row = connection.execute(
+            """
+            SELECT name, score, id
+            FROM scores
+            WHERE lower(name) = lower(?)
+            ORDER BY score DESC, id ASC
+            LIMIT 1
+            """,
+            (player_name,),
+        ).fetchone()
+        if row is None:
+            return None
+        rank = connection.execute(
+            """
+            SELECT COUNT(*) + 1
+            FROM scores
+            WHERE score > ? OR (score = ? AND id < ?)
+            """,
+            (row["score"], row["score"], row["id"]),
+        ).fetchone()[0]
+        return {"name": row["name"], "score": row["score"], "rank": rank}
+
+    @staticmethod
+    def _rank_for_score_postgres(
+        connection: Any, score_id: int
+    ) -> dict[str, object] | None:
+        row = connection.execute(
+            "SELECT name, score, id FROM douda_scores WHERE id = %s LIMIT 1",
+            (score_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        rank = connection.execute(
+            """
+            SELECT COUNT(*) + 1
+            FROM douda_scores
+            WHERE score > %s OR (score = %s AND id < %s)
+            """,
+            (row[1], row[1], row[2]),
+        ).fetchone()[0]
+        return {"name": row[0], "score": row[1], "rank": rank}
+
+    @staticmethod
+    def _rank_for_name_postgres(
+        connection: Any, player_name: str
+    ) -> dict[str, object] | None:
+        row = connection.execute(
+            """
+            SELECT name, score, id
+            FROM douda_scores
+            WHERE lower(name) = lower(%s)
+            ORDER BY score DESC, id ASC
+            LIMIT 1
+            """,
+            (player_name,),
+        ).fetchone()
+        if row is None:
+            return None
+        rank = connection.execute(
+            """
+            SELECT COUNT(*) + 1
+            FROM douda_scores
+            WHERE score > %s OR (score = %s AND id < %s)
+            """,
+            (row[1], row[1], row[2]),
+        ).fetchone()[0]
+        return {"name": row[0], "score": row[1], "rank": rank}
 
     def insert(self, name: str, score: int) -> int:
         if self._pool is None:
@@ -250,11 +293,22 @@ def create_server(
     store = LeaderboardStore(path, database_url or os.environ.get("DATABASE_URL"))
 
     class LeaderboardHandler(BaseHTTPRequestHandler):
-        def _send_json(self, status: int, payload: dict[str, object]) -> None:
+        protocol_version = "HTTP/1.1"
+
+        def _send_json(
+            self,
+            status: int,
+            payload: dict[str, object],
+            *,
+            close: bool = False,
+        ) -> None:
             body = json.dumps(payload).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            if close:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.end_headers()
             self.wfile.write(body)
 
@@ -310,8 +364,13 @@ def create_server(
                     self._send_json(400, {"error": "score_id must be positive"})
                     return
 
+            include_total = query.get("include_total", ["0"])[0].lower() in (
+                "1",
+                "true",
+                "yes",
+            )
             total, scores, player = store.page(
-                limit, offset, player_name, score_id
+                limit, offset, player_name, score_id, include_total
             )
             self._send_json(
                 200,
@@ -326,16 +385,22 @@ def create_server(
 
         def do_POST(self) -> None:
             if urlsplit(self.path).path != "/scores":
-                self._send_json(404, {"error": "Not found"})
+                self._send_json(404, {"error": "Not found"}, close=True)
                 return
 
             try:
                 content_length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
-                self._send_json(400, {"error": "Invalid Content-Length"})
+                self._send_json(
+                    400, {"error": "Invalid Content-Length"}, close=True
+                )
                 return
             if not 0 < content_length <= 4096:
-                self._send_json(400, {"error": "Request body must be 1-4096 bytes"})
+                self._send_json(
+                    400,
+                    {"error": "Request body must be 1-4096 bytes"},
+                    close=True,
+                )
                 return
 
             try:

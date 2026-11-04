@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import tempfile
 import threading
@@ -44,11 +45,46 @@ class LeaderboardServerTests(unittest.TestCase):
         submit_score(self.url, "Ada", 20)
         submit_score(self.url, "Lin", 50)
         submit_score(self.url, "Sam", 30)
-        result = get_scores(self.url, limit=2, offset=1)
+        result = get_scores(self.url, limit=2, offset=1, include_total=True)
 
         self.assertEqual(result["total"], 3)
         self.assertEqual([entry["name"] for entry in result["scores"]], ["Sam", "Ada"])
         self.assertEqual([entry["rank"] for entry in result["scores"]], [2, 3])
+
+    def test_total_is_optional(self) -> None:
+        submit_score(self.url, "Ada", 20)
+
+        result = get_scores(self.url, limit=2)
+
+        self.assertIsNone(result["total"])
+
+    def test_score_id_returns_the_rank_of_that_submission(self) -> None:
+        submit_score(self.url, "Ada", 10)
+        lin = submit_score(self.url, "Lin", 100)
+        submit_score(self.url, "Sam", 80)
+
+        result = get_scores(self.url, limit=1, score_id=int(lin["id"]))
+
+        self.assertEqual(
+            result["player"], {"name": "Lin", "score": 100, "rank": 1}
+        )
+
+    def test_http_11_keeps_the_connection_alive(self) -> None:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_port, timeout=5
+        )
+        try:
+            connection.request("GET", "/health")
+            first = connection.getresponse()
+            first.read()
+            self.assertEqual(first.status, 200)
+
+            connection.request("GET", "/scores?limit=1")
+            second = connection.getresponse()
+            second.read()
+            self.assertEqual(second.status, 200)
+        finally:
+            connection.close()
 
     def test_leaderboard_includes_top_three_and_personal_best_rank(self) -> None:
         submit_score(self.url, "Ada", 10)
